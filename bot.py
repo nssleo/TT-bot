@@ -1091,4 +1091,22 @@ async def db_status_error(interaction: discord.Interaction, error: app_commands.
         raise error
 
 
+@bot.tree.command(name="set-elo", description="[Admin] Manually set a player's Elo rating")
+@app_commands.describe(member="Player to update", rating="New Elo rating")
+@app_commands.checks.has_permissions(administrator=True)
+async def set_elo(interaction: discord.Interaction, member: discord.Member, rating: int):
+    old = db.get_rating(member.id)
+    db.set_rating(member.id, rating)
+    await interaction.response.send_message(f"{member.mention}'s rating: {old} → {rating}")
+    await update_leaderboard_message(interaction.guild)
+
+
+@set_elo.error
+async def set_elo_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("Only admins can manually set Elo.", ephemeral=True)
+    else:
+        raise error
+
+
 bot.run(TOKEN)

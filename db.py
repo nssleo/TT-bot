@@ -141,6 +141,21 @@ def get_db_status() -> dict:
         "size_bytes": os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0,
         "player_count": player_count,
     }
+
+
+def set_rating(user_id: int, rating: int):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute(
+            """
+            INSERT INTO players (user_id, rating, games_played) VALUES (?, ?, 0)
+            ON CONFLICT(user_id) DO UPDATE SET rating = excluded.rating
+            """,
+            (user_id, rating),
+        )
+        conn.commit()
+
+
+def get_rating(user_id: int) -> int:
     with closing(sqlite3.connect(DB_PATH)) as conn:
         row = conn.execute(
             "SELECT rating FROM players WHERE user_id = ?", (user_id,)
