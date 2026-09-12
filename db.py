@@ -39,10 +39,21 @@ def init_db():
             """
             CREATE TABLE IF NOT EXISTS guild_settings (
                 guild_id INTEGER PRIMARY KEY,
-                results_channel_id INTEGER
+                results_channel_id INTEGER,
+                match_category_id INTEGER,
+                match_counter INTEGER NOT NULL DEFAULT 0
             )
             """
         )
+        # Migration guard: older databases created before these columns existed.
+        for stmt in (
+            "ALTER TABLE guild_settings ADD COLUMN match_category_id INTEGER",
+            "ALTER TABLE guild_settings ADD COLUMN match_counter INTEGER NOT NULL DEFAULT 0",
+        ):
+            try:
+                conn.execute(stmt)
+            except sqlite3.OperationalError:
+                pass  # column already exists
         conn.commit()
 
 
@@ -51,9 +62,9 @@ def set_results_channel(guild_id: int, channel_id: int):
         conn.execute(
             """
             INSERT INTO guild_settings (guild_id, results_channel_id) VALUES (?, ?)
-            ON CONFLICT(guild_id) DO UPDATE SET results_channel_id = ?
+            ON CONFLICT(guild_id) DO UPDATE SET results_channel_id = excluded.results_channel_id
             """,
-            (guild_id, channel_id, channel_id),
+            (guild_id, channel_id),
         )
         conn.commit()
 
@@ -64,6 +75,43 @@ def get_results_channel(guild_id: int):
             "SELECT results_channel_id FROM guild_settings WHERE guild_id = ?", (guild_id,)
         ).fetchone()
         return row[0] if row and row[0] else None
+
+
+def set_match_category(guild_id: int, category_id: int):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute(
+            """
+            INSERT INTO guild_settings (guild_id, match_category_id) VALUES (?, ?)
+            ON CONFLICT(guild_id) DO UPDATE SET match_category_id = excluded.match_category_id
+            """,
+            (guild_id, category_id),
+        )
+        conn.commit()
+
+
+def get_match_category(guild_id: int):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        row = conn.execute(
+            "SELECT match_category_id FROM guild_settings WHERE guild_id = ?", (guild_id,)
+        ).fetchone()
+        return row[0] if row and row[0] else None
+
+
+def get_next_match_number(guild_id: int) -> int:
+    """Increments and returns the running match counter for this server (persists all season)."""
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute(
+            """
+            INSERT INTO guild_settings (guild_id, match_counter) VALUES (?, 1)
+            ON CONFLICT(guild_id) DO UPDATE SET match_counter = match_counter + 1
+            """,
+            (guild_id,),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT match_counter FROM guild_settings WHERE guild_id = ?", (guild_id,)
+        ).fetchone()
+        return row[0]
 
 
 def get_config(key: str, default: float) -> float:

@@ -1,4 +1,5 @@
 import os
+import asyncio
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -109,6 +110,73 @@ def bracket_is_finished(rounds: list[list[dict]]) -> bool:
     final_match = rounds[-1][0]
     third_match = rounds[-1][1]
     return final_match["winner"] is not None and third_match["winner"] is not None
+
+
+class AddPlayerSelect(discord.ui.UserSelect):
+    def __init__(self, parent_view):
+        super().__init__(placeholder="Select a player to add...", min_values=1, max_values=1)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction):
+        member = self.values[0]
+        if not isinstance(member, discord.Member):
+            # Resolve to a full Member if a bare User came back
+            member = interaction.guild.get_member(member.id) or member
+
+        if member.bot:
+            await interaction.response.edit_message(content="You can't add a bot to the queue.", view=None)
+            return
+        if member.id in [m.id for m in self.parent_view.queue]:
+            await interaction.response.edit_message(content=f"{member.display_name} is already in the queue.", view=None)
+            return
+
+        size = getattr(self.parent_view, "size", None)
+        started = getattr(self.parent_view, "started", False)
+        if started:
+            await interaction.response.edit_message(content="This bracket has already started.", view=None)
+            return
+        if size and len(self.parent_view.queue) >= size:
+            await interaction.response.edit_message(content="The queue is already full.", view=None)
+            return
+
+        self.parent_view.queue.append(member)
+        if size and len(self.parent_view.queue) == size:
+            self.parent_view.start_bracket()
+
+        await interaction.response.edit_message(content=f"Added {member.display_name} to the queue.", view=None)
+        await self.parent_view.refresh()
+
+
+class AddPlayerView(discord.ui.View):
+    def __init__(self, parent_view):
+        super().__init__(timeout=60)
+        self.add_item(AddPlayerSelect(parent_view))
+
+
+class CloseChannelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, emoji="🔒")
+    async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("Closing this channel...")
+        try:
+            await interaction.channel.delete()
+        except discord.HTTPException:
+            pass
+
+
+def get_sorted_pairs(members: list[discord.Member]):
+    """Sorts by Elo desc and pairs adjacently (1v2, 3v4, ...). Returns (pairs, leftover_or_None)."""
+    sorted_m = sorted(members, key=lambda m: db.get_rating(m.id), reverse=True)
+    pairs = []
+    leftover = None
+    for i in range(0, len(sorted_m), 2):
+        if i + 1 < len(sorted_m):
+            pairs.append((sorted_m[i], sorted_m[i + 1]))
+        else:
+            leftover = sorted_m[i]
+    return pairs, leftover
 
 
 class KickSelect(discord.ui.Select):
@@ -226,6 +294,62 @@ class LFMView(discord.ui.View):
             "Who do you want to remove?", view=KickView(self), ephemeral=True
         )
 
+    @discord.ui.button(label="Add Player", style=discord.ButtonStyle.secondary, emoji="➕")
+    async def add_player(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "Who do you want to add to the queue?", view=AddPlayerView(self), ephemeral=True
+        )
+
+    @discord.ui.button(label="Start Matches", style=discord.ButtonStyle.primary, emoji="▶️")
+    async def start_matches(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if len(self.queue) < 2:
+            await interaction.response.send_message(
+                "Need at least 2 players in the queue to start matches.", ephemeral=True
+            )
+            return
+
+        if self.queue_type == "global":
+            await interaction.response.send_message("🏓 Starting matches!")
+            channel = interaction.channel
+            for n in (5, 4, 3, 2, 1):
+                await asyncio.sleep(1)
+                await channel.send(str(n))
+            await asyncio.sleep(1)
+            await channel.send("**GO**")
+            return
+
+        # casual / ranked -> create a private match channel per pairing
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild = interaction.guild
+        category_id = db.get_match_category(guild.id)
+        category = guild.get_channel(category_id) if category_id else None
+
+        pairs, leftover = get_sorted_pairs(self.queue)
+        created = []
+        for p1, p2 in pairs:
+            number = db.get_next_match_number(guild.id)
+            name = f"Match {number}: {p1.display_name} vs {p2.display_name}"
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                p1: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+                p2: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+            }
+            try:
+                channel = await guild.create_text_channel(name=name, category=category, overwrites=overwrites)
+            except discord.HTTPException:
+                safe_name = f"match-{number}-{p1.display_name}-vs-{p2.display_name}"
+                channel = await guild.create_text_channel(name=safe_name, category=category, overwrites=overwrites)
+            await channel.send(
+                content=f"{p1.mention} vs {p2.mention} — when the match is over, press Close.",
+                view=CloseChannelView(),
+            )
+            created.append(channel)
+
+        summary = "\n".join(c.mention for c in created) if created else "*No full pairs found.*"
+        if leftover:
+            summary += f"\n\n{leftover.mention} is waiting for an opponent (odd number of players)."
+        await interaction.followup.send(f"Created {len(created)} match channel(s):\n{summary}", ephemeral=True)
+
     async def on_timeout(self):
         for item in self.children:
             item.disabled = True
@@ -317,6 +441,23 @@ async def post_to_results_channel(guild: discord.Guild, content: str = None, emb
         pass
 
 
+def build_match_result_embed(winner: discord.Member, loser: discord.Member, before: dict, after: dict, label: str) -> discord.Embed:
+    """Same style as /record-match: shows old -> new rating with the delta for both players."""
+    def line(member, tag):
+        old = before[member.id]
+        new = after[member.id]
+        delta = new - old
+        sign = "+" if delta >= 0 else ""
+        return f"**{tag}** {member.mention} — {old} → {new} ({sign}{delta})"
+
+    embed = discord.Embed(
+        title="🏓 Match Result",
+        description=f"{label}\n\n{line(winner, 'W')}\n{line(loser, 'L')}",
+        color=discord.Color.orange(),
+    )
+    return embed
+
+
 class ConfirmResultView(discord.ui.View):
     """
     Generic result-confirmation view.
@@ -364,13 +505,18 @@ class ConfirmResultView(discord.ui.View):
             return
         self.resolved = True
 
+        before = {self.winner.id: db.get_rating(self.winner.id), self.loser.id: db.get_rating(self.loser.id)}
         deltas = db.calculate_elo_changes([self.winner.id, self.loser.id])
         db.apply_rating_changes({self.winner.id: deltas[0], self.loser.id: deltas[1]})
+        after = {self.winner.id: before[self.winner.id] + deltas[0], self.loser.id: before[self.loser.id] + deltas[1]}
+
+        result_embed = build_match_result_embed(self.winner, self.loser, before, after, self.label)
 
         for item in self.children:
             item.disabled = True
         await interaction.response.edit_message(
-            content=f"✅ Confirmed by {interaction.user.mention}: **{self.winner.mention}** defeated {self.loser.mention} — {self.label}",
+            content=f"✅ Confirmed by {interaction.user.mention}",
+            embed=result_embed,
             view=self,
         )
 
@@ -380,10 +526,7 @@ class ConfirmResultView(discord.ui.View):
             guild = interaction.guild
             if guild:
                 await update_leaderboard_message(guild)
-                await post_to_results_channel(
-                    guild,
-                    content=f"🏓 **{self.winner.mention}** defeated {self.loser.mention} — {self.label}",
-                )
+                await post_to_results_channel(guild, embed=result_embed)
 
     @discord.ui.button(label="Reject", style=discord.ButtonStyle.danger, emoji="❌")
     async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -665,6 +808,15 @@ class BracketView(discord.ui.View):
             "Who do you want to remove?", view=KickView(self), ephemeral=True
         )
 
+    @discord.ui.button(label="Add Player", style=discord.ButtonStyle.secondary, emoji="➕")
+    async def add_player(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.started:
+            await interaction.response.send_message("The bracket has already started.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            "Who do you want to add to the bracket?", view=AddPlayerView(self), ephemeral=True
+        )
+
     async def on_timeout(self):
         for item in self.children:
             item.disabled = True
@@ -853,6 +1005,24 @@ async def report_match(interaction: discord.Interaction, opponent: discord.Membe
         view=confirm_view,
     )
     confirm_view.message = await interaction.original_response()
+
+
+@bot.tree.command(name="set-match-category", description="[Admin] Set the category where private match channels are created")
+@app_commands.describe(category="Category for Start Matches channels")
+@app_commands.checks.has_permissions(administrator=True)
+async def set_match_category(interaction: discord.Interaction, category: discord.CategoryChannel):
+    db.set_match_category(interaction.guild_id, category.id)
+    await interaction.response.send_message(f"Match channels will now be created under **{category.name}**.")
+
+
+@set_match_category.error
+async def set_match_category_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message(
+            "Only admins can set the match category.", ephemeral=True
+        )
+    else:
+        raise error
 
 
 bot.run(TOKEN)
