@@ -26,13 +26,89 @@ async def ping(interaction: discord.Interaction):
 
 
 QUEUE_TYPES = {
-    "casual": {"label": "Casual", "emoji": "🎮", "color": discord.Color.green()},
-    "ranked": {"label": "Ranked", "emoji": "🏆", "color": discord.Color.red()},
-    "global": {"label": "Global", "emoji": "🌐", "color": discord.Color.blue()},
+    "casual": {"label": "Casual", "emoji": "🎮", "color": discord.Color.green(), "size": None},
+    "ranked": {"label": "Ranked", "emoji": "🏆", "color": discord.Color.red(), "size": None},
+    "global": {"label": "Global", "emoji": "🌐", "color": discord.Color.blue(), "size": None},
+    "bracket4": {"label": "4-Player Bracket", "emoji": "🥊", "color": discord.Color.purple(), "size": 4},
+    "bracket8": {"label": "8-Player Bracket", "emoji": "🥊", "color": discord.Color.dark_purple(), "size": 8},
 }
 
 # Tracks the currently active queue message per (guild_id, queue_type)
-active_queues: dict[tuple[int, str], "LFMView"] = {}
+active_queues: dict[tuple[int, str], object] = {}
+
+
+def build_bracket_rounds(seeded_players: list[discord.Member]) -> list[list[dict]]:
+    """seeded_players must already be sorted by Elo descending."""
+    size = len(seeded_players)
+    s = seeded_players
+    if size == 4:
+        round1 = [
+            {"player1": s[0], "player2": s[3], "winner": None, "label": "Semifinal 1"},
+            {"player1": s[1], "player2": s[2], "winner": None, "label": "Semifinal 2"},
+        ]
+        round2 = [
+            {"player1": None, "player2": None, "winner": None, "label": "Final"},
+            {"player1": None, "player2": None, "winner": None, "label": "3rd Place Match"},
+        ]
+        return [round1, round2]
+    elif size == 8:
+        round1 = [
+            {"player1": s[0], "player2": s[7], "winner": None, "label": "Quarterfinal 1"},
+            {"player1": s[3], "player2": s[4], "winner": None, "label": "Quarterfinal 2"},
+            {"player1": s[1], "player2": s[6], "winner": None, "label": "Quarterfinal 3"},
+            {"player1": s[2], "player2": s[5], "winner": None, "label": "Quarterfinal 4"},
+        ]
+        round2 = [
+            {"player1": None, "player2": None, "winner": None, "label": "Semifinal 1"},
+            {"player1": None, "player2": None, "winner": None, "label": "Semifinal 2"},
+        ]
+        round3 = [
+            {"player1": None, "player2": None, "winner": None, "label": "Final"},
+            {"player1": None, "player2": None, "winner": None, "label": "3rd Place Match"},
+        ]
+        return [round1, round2, round3]
+    raise ValueError("Only bracket sizes 4 and 8 are supported")
+
+
+def record_bracket_result(rounds: list[list[dict]], round_idx: int, match_idx: int, winner: discord.Member):
+    """Records a winner and propagates winner/loser to the next round. Returns the loser."""
+    match = rounds[round_idx][match_idx]
+    match["winner"] = winner
+    loser = match["player2"] if winner.id == match["player1"].id else match["player1"]
+    last_idx = len(rounds) - 1
+
+    if round_idx == last_idx:
+        pass  # Final or 3rd place match — nothing further to propagate
+    elif round_idx == last_idx - 1:
+        # Semifinal round: winner -> Final, loser -> 3rd Place Match
+        final_match = rounds[last_idx][0]
+        third_match = rounds[last_idx][1]
+        slot = "player1" if match_idx == 0 else "player2"
+        final_match[slot] = winner
+        third_match[slot] = loser
+    else:
+        # Earlier round (e.g. quarterfinals): winner advances, loser is eliminated
+        nxt = rounds[round_idx + 1][match_idx // 2]
+        slot = "player1" if match_idx % 2 == 0 else "player2"
+        nxt[slot] = winner
+
+    return loser
+
+
+def get_pending_bracket_matches(rounds: list[list[dict]]):
+    """Returns list of (round_idx, match_idx, match) for matches ready to be played."""
+    pending = []
+    for r_idx, round_matches in enumerate(rounds):
+        for m_idx, match in enumerate(round_matches):
+            if match["player1"] and match["player2"] and match["winner"] is None:
+                pending.append((r_idx, m_idx, match))
+    return pending
+
+
+def bracket_is_finished(rounds: list[list[dict]]) -> bool:
+    final_match = rounds[-1][0]
+    third_match = rounds[-1][1]
+    return final_match["winner"] is not None and third_match["winner"] is not None
 
 
 class KickSelect(discord.ui.Select):
@@ -163,10 +239,10 @@ class LFMView(discord.ui.View):
             del active_queues[key]
 
 
-@bot.tree.command(name="queue", description="Start or join a match queue and ping a role")
+@bot.tree.command(name="queue", description="Start or join a match queue")
 @app_commands.describe(
     type="Which queue to start",
-    role="Role to ping (e.g. @TableTennis)",
+    role="Role to ping (optional — if set, sent as a separate message so it always notifies)",
     note="Optional note, e.g. 'casual only'",
 )
 @app_commands.choices(
@@ -174,33 +250,355 @@ class LFMView(discord.ui.View):
         app_commands.Choice(name="Casual", value="casual"),
         app_commands.Choice(name="Ranked", value="ranked"),
         app_commands.Choice(name="Global", value="global"),
+        app_commands.Choice(name="4-Player Bracket", value="bracket4"),
+        app_commands.Choice(name="8-Player Bracket", value="bracket8"),
     ]
 )
 async def queue(
     interaction: discord.Interaction,
     type: app_commands.Choice[str],
-    role: discord.Role,
+    role: discord.Role = None,
     note: str = None,
 ):
     key = (interaction.guild_id, type.value)
     existing = active_queues.get(key)
     if existing:
         link = existing.message.jump_url if existing.message else None
-        msg = f"A {type.name} queue is already active."
+        msg = f"A {type.name} is already active."
         if link:
             msg += f" Jump to it here: {link}"
         await interaction.response.send_message(msg, ephemeral=True)
         return
 
-    view = LFMView(
-        requester=interaction.user,
-        queue_type=type.value,
-        guild_id=interaction.guild_id,
-        note=note,
-    )
-    await interaction.response.send_message(content=role.mention, embed=view.build_embed(), view=view)
-    view.message = await interaction.original_response()
+    size = QUEUE_TYPES[type.value]["size"]
+    if size:
+        view = BracketView(
+            requester=interaction.user,
+            queue_type=type.value,
+            guild_id=interaction.guild_id,
+            size=size,
+            note=note,
+        )
+    else:
+        view = LFMView(
+            requester=interaction.user,
+            queue_type=type.value,
+            guild_id=interaction.guild_id,
+            note=note,
+        )
+
+    if role:
+        # Ping goes out as its own plain message so it always notifies,
+        # separate from the queue embed itself.
+        await interaction.response.send_message(role.mention)
+        message = await interaction.followup.send(embed=view.build_embed(), view=view)
+    else:
+        await interaction.response.send_message(embed=view.build_embed(), view=view)
+        message = await interaction.original_response()
+
+    view.message = message
     active_queues[key] = view
+
+
+class ConfirmResultView(discord.ui.View):
+    def __init__(self, bracket_view: "BracketView", round_idx: int, match_idx: int, winner: discord.Member, loser: discord.Member, reporter_id: int):
+        super().__init__(timeout=600)  # 10 minutes to confirm
+        self.bracket_view = bracket_view
+        self.round_idx = round_idx
+        self.match_idx = match_idx
+        self.winner = winner
+        self.loser = loser
+        self.reporter_id = reporter_id
+        self.resolved = False
+
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.success, emoji="✅")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id == self.reporter_id:
+            await interaction.response.send_message(
+                "You reported this result — someone else needs to confirm it.", ephemeral=True
+            )
+            return
+        if self.resolved:
+            await interaction.response.send_message("This result was already resolved.", ephemeral=True)
+            return
+        self.resolved = True
+
+        match = self.bracket_view.rounds[self.round_idx][self.match_idx]
+        record_bracket_result(self.bracket_view.rounds, self.round_idx, self.match_idx, self.winner)
+
+        deltas = db.calculate_elo_changes([self.winner.id, self.loser.id])
+        db.apply_rating_changes({self.winner.id: deltas[0], self.loser.id: deltas[1]})
+
+        if bracket_is_finished(self.bracket_view.rounds):
+            self.bracket_view.finished = True
+            self.bracket_view.clear_items()
+            key = (self.bracket_view.guild_id, self.bracket_view.queue_type)
+            if active_queues.get(key) is self.bracket_view:
+                del active_queues[key]
+
+        await self.bracket_view.refresh()
+
+        guild = interaction.guild
+        if guild:
+            await update_leaderboard_message(guild)
+
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            content=f"✅ Confirmed by {interaction.user.mention}: **{self.winner.mention}** defeated {self.loser.mention} — {match['label']}",
+            view=self,
+        )
+
+    @discord.ui.button(label="Reject", style=discord.ButtonStyle.danger, emoji="❌")
+    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.resolved:
+            await interaction.response.send_message("This result was already resolved.", ephemeral=True)
+            return
+        self.resolved = True
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            content=f"❌ Result rejected by {interaction.user.mention}. Please record the match again if needed.",
+            view=self,
+        )
+
+    async def on_timeout(self):
+        if not self.resolved:
+            for item in self.children:
+                item.disabled = True
+            try:
+                await self.message.edit(
+                    content="⏱️ This result report expired without confirmation.", view=self
+                )
+            except (discord.HTTPException, AttributeError):
+                pass
+
+
+class BracketWinnerSelect(discord.ui.Select):
+    def __init__(self, bracket_view: "BracketView", round_idx: int, match_idx: int, match: dict):
+        self.bracket_view = bracket_view
+        self.round_idx = round_idx
+        self.match_idx = match_idx
+        self.match = match
+        options = [
+            discord.SelectOption(label=f"{match['player1'].display_name} wins", value=str(match["player1"].id)),
+            discord.SelectOption(label=f"{match['player2'].display_name} wins", value=str(match["player2"].id)),
+        ]
+        super().__init__(placeholder="Who won?", options=options, min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        winner_id = int(self.values[0])
+        winner = self.match["player1"] if self.match["player1"].id == winner_id else self.match["player2"]
+        loser = self.match["player2"] if winner.id == self.match["player1"].id else self.match["player1"]
+
+        await interaction.response.edit_message(
+            content="Report submitted — waiting for confirmation.", view=None
+        )
+
+        confirm_view = ConfirmResultView(
+            self.bracket_view, self.round_idx, self.match_idx, winner, loser, reporter_id=interaction.user.id
+        )
+        if self.bracket_view.message:
+            confirm_view.message = await self.bracket_view.message.channel.send(
+                content=(
+                    f"📋 {interaction.user.mention} reports **{winner.mention}** defeated {loser.mention} "
+                    f"in **{self.match['label']}**.\nSomeone other than the reporter must confirm."
+                ),
+                view=confirm_view,
+            )
+
+
+class BracketWinnerView(discord.ui.View):
+    def __init__(self, bracket_view: "BracketView", round_idx: int, match_idx: int, match: dict):
+        super().__init__(timeout=120)
+        self.add_item(BracketWinnerSelect(bracket_view, round_idx, match_idx, match))
+
+
+class BracketMatchSelect(discord.ui.Select):
+    def __init__(self, bracket_view: "BracketView", pending: list):
+        self.bracket_view = bracket_view
+        self.pending = pending
+        options = [
+            discord.SelectOption(
+                label=f"{match['label']}: {match['player1'].display_name} vs {match['player2'].display_name}",
+                value=f"{r_idx}:{m_idx}",
+            )
+            for r_idx, m_idx, match in pending
+        ]
+        super().__init__(placeholder="Select the match to record...", options=options, min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        r_idx_str, m_idx_str = self.values[0].split(":")
+        r_idx, m_idx = int(r_idx_str), int(m_idx_str)
+        match = self.bracket_view.rounds[r_idx][m_idx]
+        await interaction.response.edit_message(
+            content=f"**{match['label']}**: {match['player1'].mention} vs {match['player2'].mention}\nWho won?",
+            view=BracketWinnerView(self.bracket_view, r_idx, m_idx, match),
+        )
+
+
+class BracketMatchPickView(discord.ui.View):
+    def __init__(self, bracket_view: "BracketView", pending: list):
+        super().__init__(timeout=120)
+        self.add_item(BracketMatchSelect(bracket_view, pending))
+
+
+class RecordMatchButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Record Match", style=discord.ButtonStyle.primary, emoji="📝")
+
+    async def callback(self, interaction: discord.Interaction):
+        bracket_view: BracketView = self.view
+        if bracket_view.finished:
+            await interaction.response.send_message("This bracket is already finished.", ephemeral=True)
+            return
+        pending = get_pending_bracket_matches(bracket_view.rounds)
+        if not pending:
+            await interaction.response.send_message("No matches are ready to record yet.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            "Which match do you want to record?", view=BracketMatchPickView(bracket_view, pending), ephemeral=True
+        )
+
+
+class BracketView(discord.ui.View):
+    def __init__(self, requester: discord.Member, queue_type: str, guild_id: int, size: int, note: str = None):
+        super().__init__(timeout=3600)
+        self.requester = requester
+        self.queue_type = queue_type
+        self.guild_id = guild_id
+        self.size = size
+        self.note = note
+        self.queue: list[discord.Member] = []
+        self.message: discord.Message = None
+        self.rounds: list[list[dict]] = None
+        self.started = False
+        self.finished = False
+
+    def build_embed(self) -> discord.Embed:
+        info = QUEUE_TYPES[self.queue_type]
+        embed = discord.Embed(title=f"{info['emoji']} {info['label']}", color=info["color"])
+        embed.add_field(name="Started by", value=self.requester.mention, inline=True)
+        if self.note:
+            embed.add_field(name="Note", value=self.note, inline=False)
+
+        if not self.started:
+            if self.queue:
+                listing = "\n".join(f"{i+1}. {m.mention}" for i, m in enumerate(self.queue))
+            else:
+                listing = "*No one in queue yet.*"
+            embed.add_field(name=f"Players ({len(self.queue)}/{self.size})", value=listing, inline=False)
+            embed.set_footer(text="Bracket starts automatically once full")
+            return embed
+
+        # Bracket in progress or finished — show full bracket state
+        for round_matches in self.rounds:
+            lines = []
+            for match in round_matches:
+                p1 = match["player1"]
+                p2 = match["player2"]
+                if p1 is None or p2 is None:
+                    lines.append(f"**{match['label']}**: TBD")
+                elif match["winner"] is not None:
+                    winner = match["winner"]
+                    loser = p2 if winner.id == p1.id else p1
+                    lines.append(f"**{match['label']}**: ✅ {winner.mention} def. {loser.mention}")
+                else:
+                    lines.append(f"**{match['label']}**: ⏳ {p1.mention} vs {p2.mention}")
+            round_name = round_matches[0]["label"].split()[0] if len(round_matches) > 1 else "Round"
+            embed.add_field(name=f"Round: {round_name}s", value="\n".join(lines), inline=False)
+
+        pending = get_pending_bracket_matches(self.rounds)
+        if pending and not self.finished:
+            next_lines = [f"{m['label']}: {m['player1'].mention} vs {m['player2'].mention}" for _, _, m in pending]
+            embed.add_field(name="▶️ Next Matches", value="\n".join(next_lines), inline=False)
+
+        if self.finished:
+            final_match = self.rounds[-1][0]
+            third_match = self.rounds[-1][1]
+            champion = final_match["winner"]
+            runner_up = final_match["player2"] if champion.id == final_match["player1"].id else final_match["player1"]
+            third = third_match["winner"]
+            fourth = third_match["player2"] if third.id == third_match["player1"].id else third_match["player1"]
+            standings = (
+                f"🥇 {champion.mention}\n"
+                f"🥈 {runner_up.mention}\n"
+                f"🥉 {third.mention}\n"
+                f"4️⃣ {fourth.mention}"
+            )
+            embed.add_field(name="🏁 Final Ranking", value=standings, inline=False)
+            embed.set_footer(text="Bracket complete")
+        else:
+            embed.set_footer(text="Admins: use Record Match after each game")
+
+        return embed
+
+    async def refresh(self):
+        if self.message:
+            try:
+                await self.message.edit(embed=self.build_embed(), view=self)
+            except discord.HTTPException:
+                pass
+
+    def start_bracket(self):
+        seeded = sorted(self.queue, key=lambda m: db.get_rating(m.id), reverse=True)
+        self.rounds = build_bracket_rounds(seeded)
+        self.started = True
+        self.clear_items()
+        self.add_item(RecordMatchButton())
+
+    @discord.ui.button(label="Join Queue", style=discord.ButtonStyle.success, emoji="🏓")
+    async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id in [m.id for m in self.queue]:
+            await interaction.response.send_message("You're already in the queue.", ephemeral=True)
+            return
+        if len(self.queue) >= self.size:
+            await interaction.response.send_message("This bracket is already full.", ephemeral=True)
+            return
+        self.queue.append(interaction.user)
+        if len(self.queue) == self.size:
+            self.start_bracket()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="Leave Queue", style=discord.ButtonStyle.secondary, emoji="🚪")
+    async def leave(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.started:
+            await interaction.response.send_message("The bracket has already started.", ephemeral=True)
+            return
+        if interaction.user.id not in [m.id for m in self.queue]:
+            await interaction.response.send_message("You're not in the queue.", ephemeral=True)
+            return
+        self.queue = [m for m in self.queue if m.id != interaction.user.id]
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="Kick Queue", style=discord.ButtonStyle.danger, emoji="⛔")
+    async def kick(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.started:
+            await interaction.response.send_message("The bracket has already started.", ephemeral=True)
+            return
+        if interaction.user.id != self.requester.id:
+            await interaction.response.send_message(
+                "Only the person who started this bracket can kick players.", ephemeral=True
+            )
+            return
+        if not self.queue:
+            await interaction.response.send_message("Queue is empty.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            "Who do you want to remove?", view=KickView(self), ephemeral=True
+        )
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+        key = (self.guild_id, self.queue_type)
+        if active_queues.get(key) is self:
+            del active_queues[key]
 
 
 async def build_leaderboard_embed(guild: discord.Guild) -> discord.Embed:
