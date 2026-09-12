@@ -45,6 +45,16 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bracket_counters (
+                guild_id INTEGER NOT NULL,
+                size INTEGER NOT NULL,
+                counter INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, size)
+            )
+            """
+        )
         # Migration guard: older databases created before these columns existed.
         for stmt in (
             "ALTER TABLE guild_settings ADD COLUMN match_category_id INTEGER",
@@ -110,6 +120,23 @@ def get_next_match_number(guild_id: int) -> int:
         conn.commit()
         row = conn.execute(
             "SELECT match_counter FROM guild_settings WHERE guild_id = ?", (guild_id,)
+        ).fetchone()
+        return row[0]
+
+
+def get_next_bracket_number(guild_id: int, size: int) -> int:
+    """Independent running counter per bracket size (4-player and 8-player number separately)."""
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute(
+            """
+            INSERT INTO bracket_counters (guild_id, size, counter) VALUES (?, ?, 1)
+            ON CONFLICT(guild_id, size) DO UPDATE SET counter = counter + 1
+            """,
+            (guild_id, size),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT counter FROM bracket_counters WHERE guild_id = ? AND size = ?", (guild_id, size)
         ).fetchone()
         return row[0]
 

@@ -109,6 +109,24 @@ def get_pending_bracket_matches(rounds: list[list[dict]]):
     return pending
 
 
+def build_consolation_rounds(losers_in_qf_order: list[discord.Member]) -> list[list[dict]]:
+    """
+    Builds the 5th-8th place bracket from the 4 quarterfinal losers, in QF order
+    (i.e. [QF1_loser, QF2_loser, QF3_loser, QF4_loser]) — mirroring the main bracket's
+    semifinal pairing (QF1+QF2 winners meet, QF3+QF4 winners meet).
+    """
+    lo = losers_in_qf_order
+    round1 = [
+        {"player1": lo[0], "player2": lo[1], "winner": None, "label": "5th-8th Semifinal 1"},
+        {"player1": lo[2], "player2": lo[3], "winner": None, "label": "5th-8th Semifinal 2"},
+    ]
+    round2 = [
+        {"player1": None, "player2": None, "winner": None, "label": "5th Place Match"},
+        {"player1": None, "player2": None, "winner": None, "label": "7th Place Match"},
+    ]
+    return [round1, round2]
+
+
 def bracket_is_finished(rounds: list[list[dict]]) -> bool:
     final_match = rounds[-1][0]
     third_match = rounds[-1][1]
@@ -418,7 +436,17 @@ async def queue(
             return
 
     size = QUEUE_TYPES[type.value]["size"]
+
     if size:
+        # Brackets get their own dedicated channel, e.g. "4p-bracket-1", "8p-bracket-1"
+        # — separate running counters per size.
+        guild = interaction.guild
+        bracket_number = db.get_next_bracket_number(guild.id, size)
+        channel_name = f"{size}p-bracket-{bracket_number}"
+        category_id = db.get_match_category(guild.id)
+        category = guild.get_channel(category_id) if category_id else None
+        bracket_channel = await guild.create_text_channel(name=channel_name, category=category)
+
         view = BracketView(
             requester=interaction.user,
             queue_type=type.value,
@@ -426,13 +454,22 @@ async def queue(
             size=size,
             note=note,
         )
-    else:
-        view = LFMView(
-            requester=interaction.user,
-            queue_type=type.value,
-            guild_id=interaction.guild_id,
-            note=note,
+        if role:
+            await bracket_channel.send(role.mention)
+        message = await bracket_channel.send(embed=view.build_embed(), view=view)
+        view.message = message
+
+        await interaction.response.send_message(
+            f"Created {bracket_channel.mention} for this bracket!", ephemeral=True
         )
+        return
+
+    view = LFMView(
+        requester=interaction.user,
+        queue_type=type.value,
+        guild_id=interaction.guild_id,
+        note=note,
+    )
 
     if role:
         # Ping goes out as its own plain message so it always notifies,
@@ -444,8 +481,7 @@ async def queue(
         message = await interaction.original_response()
 
     view.message = message
-    if not is_bracket:
-        active_queues[key] = view
+    active_queues[key] = view
 
 
 async def post_to_results_channel(guild: discord.Guild, content: str = None, embed: discord.Embed = None):
@@ -488,7 +524,9 @@ class ConfirmResultView(discord.ui.View):
     Generic result-confirmation view.
     - required_confirmer_id set -> only that specific user may confirm (used for 1v1 reports).
     - required_confirmer_id None -> anyone except the reporter may confirm (used for bracket matches).
-    - on_confirm(interaction) is called after Elo is applied, for any extra bookkeeping
+    - apply_elo controls whether Elo is updated for this specific confirmation. Bracket matches pass
+      False — only the final bracket standings affect Elo, not individual games.
+    - on_confirm(interaction) is called after any Elo is applied, for extra bookkeeping
       (e.g. advancing a bracket). If omitted, the confirmed result is posted to the results channel.
     """
 
@@ -500,6 +538,7 @@ class ConfirmResultView(discord.ui.View):
         label: str,
         required_confirmer_id: int = None,
         on_confirm=None,
+        apply_elo: bool = True,
     ):
         super().__init__(timeout=600)  # 10 minutes to confirm
         self.winner = winner
@@ -508,6 +547,7 @@ class ConfirmResultView(discord.ui.View):
         self.label = label
         self.required_confirmer_id = required_confirmer_id
         self.on_confirm = on_confirm
+        self.apply_elo = apply_elo
         self.resolved = False
         self.message: discord.Message = None
 
@@ -530,12 +570,21 @@ class ConfirmResultView(discord.ui.View):
             return
         self.resolved = True
 
-        before = {self.winner.id: db.get_rating(self.winner.id), self.loser.id: db.get_rating(self.loser.id)}
-        deltas = db.calculate_elo_changes([self.winner.id, self.loser.id])
-        db.apply_rating_changes({self.winner.id: deltas[0], self.loser.id: deltas[1]})
-        after = {self.winner.id: before[self.winner.id] + deltas[0], self.loser.id: before[self.loser.id] + deltas[1]}
-
-        result_embed = build_match_result_embed(self.winner, self.loser, before, after, self.label)
+        if self.apply_elo:
+            before = {self.winner.id: db.get_rating(self.winner.id), self.loser.id: db.get_rating(self.loser.id)}
+            deltas = db.calculate_elo_changes([self.winner.id, self.loser.id])
+            db.apply_rating_changes({self.winner.id: deltas[0], self.loser.id: deltas[1]})
+            after = {self.winner.id: before[self.winner.id] + deltas[0], self.loser.id: before[self.loser.id] + deltas[1]}
+            result_embed = build_match_result_embed(self.winner, self.loser, before, after, self.label)
+        else:
+            result_embed = discord.Embed(
+                title="🏓 Match Result",
+                description=(
+                    f"{self.label}\n\n**{self.winner.mention}** defeated {self.loser.mention}\n\n"
+                    f"*Elo unaffected — only final bracket standings count.*"
+                ),
+                color=discord.Color.orange(),
+            )
 
         for item in self.children:
             item.disabled = True
@@ -596,8 +645,9 @@ class ConfirmResultView(discord.ui.View):
 
 
 class BracketWinnerSelect(discord.ui.Select):
-    def __init__(self, bracket_view: "BracketView", round_idx: int, match_idx: int, match: dict):
+    def __init__(self, bracket_view: "BracketView", bracket_key: str, round_idx: int, match_idx: int, match: dict):
         self.bracket_view = bracket_view
+        self.bracket_key = bracket_key
         self.round_idx = round_idx
         self.match_idx = match_idx
         self.match = match
@@ -617,14 +667,22 @@ class BracketWinnerSelect(discord.ui.Select):
         )
 
         bracket_view = self.bracket_view
+        bracket_key = self.bracket_key
         round_idx = self.round_idx
         match_idx = self.match_idx
 
         async def on_confirm(confirm_interaction: discord.Interaction):
-            record_bracket_result(bracket_view.rounds, round_idx, match_idx, winner)
-            if bracket_is_finished(bracket_view.rounds):
+            rounds = bracket_view.get_rounds(bracket_key)
+            record_bracket_result(rounds, round_idx, match_idx, winner)
+
+            if bracket_key == "main" and round_idx == 0:
+                bracket_view.maybe_start_losers_bracket()
+
+            if bracket_view.is_fully_finished():
                 bracket_view.finished = True
                 bracket_view.clear_items()
+                bracket_view.compute_final_standings()
+
             await bracket_view.refresh()
             guild = confirm_interaction.guild
             if guild:
@@ -639,6 +697,7 @@ class BracketWinnerSelect(discord.ui.Select):
             label=self.match["label"],
             required_confirmer_id=None,  # anyone but the reporter
             on_confirm=on_confirm,
+            apply_elo=False,  # individual bracket games don't affect Elo — only final standings do
         )
         if self.bracket_view.message:
             confirm_view.message = await self.bracket_view.message.channel.send(
@@ -651,9 +710,9 @@ class BracketWinnerSelect(discord.ui.Select):
 
 
 class BracketWinnerView(discord.ui.View):
-    def __init__(self, bracket_view: "BracketView", round_idx: int, match_idx: int, match: dict):
+    def __init__(self, bracket_view: "BracketView", bracket_key: str, round_idx: int, match_idx: int, match: dict):
         super().__init__(timeout=120)
-        self.add_item(BracketWinnerSelect(bracket_view, round_idx, match_idx, match))
+        self.add_item(BracketWinnerSelect(bracket_view, bracket_key, round_idx, match_idx, match))
 
 
 class BracketMatchSelect(discord.ui.Select):
@@ -663,19 +722,19 @@ class BracketMatchSelect(discord.ui.Select):
         options = [
             discord.SelectOption(
                 label=f"{match['label']}: {match['player1'].display_name} vs {match['player2'].display_name}",
-                value=f"{r_idx}:{m_idx}",
+                value=f"{key}:{r_idx}:{m_idx}",
             )
-            for r_idx, m_idx, match in pending
+            for key, r_idx, m_idx, match in pending
         ]
         super().__init__(placeholder="Select the match to record...", options=options, min_values=1, max_values=1)
 
     async def callback(self, interaction: discord.Interaction):
-        r_idx_str, m_idx_str = self.values[0].split(":")
+        key, r_idx_str, m_idx_str = self.values[0].split(":")
         r_idx, m_idx = int(r_idx_str), int(m_idx_str)
-        match = self.bracket_view.rounds[r_idx][m_idx]
+        match = self.bracket_view.get_rounds(key)[r_idx][m_idx]
         await interaction.response.edit_message(
             content=f"**{match['label']}**: {match['player1'].mention} vs {match['player2'].mention}\nWho won?",
-            view=BracketWinnerView(self.bracket_view, r_idx, m_idx, match),
+            view=BracketWinnerView(self.bracket_view, key, r_idx, m_idx, match),
         )
 
 
@@ -694,7 +753,7 @@ class RecordMatchButton(discord.ui.Button):
         if bracket_view.finished:
             await interaction.response.send_message("This bracket is already finished.", ephemeral=True)
             return
-        pending = get_pending_bracket_matches(bracket_view.rounds)
+        pending = bracket_view.get_all_pending_matches()
         if not pending:
             await interaction.response.send_message("No matches are ready to record yet.", ephemeral=True)
             return
@@ -714,8 +773,64 @@ class BracketView(discord.ui.View):
         self.queue: list[discord.Member] = []
         self.message: discord.Message = None
         self.rounds: list[list[dict]] = None
+        self.losers_rounds: list[list[dict]] = None  # 5th-8th bracket, only used when size == 8
         self.started = False
         self.finished = False
+        self.final_standings = None  # set once fully finished: list of (member, elo_delta) tuples
+
+    def get_all_pending_matches(self):
+        """Returns list of (bracket_key, round_idx, match_idx, match) across main + losers brackets."""
+        pending = [("main", r, m, match) for r, m, match in get_pending_bracket_matches(self.rounds)]
+        if self.losers_rounds:
+            pending += [("losers", r, m, match) for r, m, match in get_pending_bracket_matches(self.losers_rounds)]
+        return pending
+
+    def get_rounds(self, bracket_key: str):
+        return self.rounds if bracket_key == "main" else self.losers_rounds
+
+    def maybe_start_losers_bracket(self):
+        """After all 4 quarterfinals finish, spin up the 5th-8th bracket from their losers."""
+        if self.size != 8 or self.losers_rounds is not None:
+            return
+        qf_round = self.rounds[0]
+        if not all(m["winner"] is not None for m in qf_round):
+            return
+        losers = []
+        for m in qf_round:
+            loser = m["player2"] if m["winner"].id == m["player1"].id else m["player1"]
+            losers.append(loser)
+        self.losers_rounds = build_consolation_rounds(losers)
+
+    def is_fully_finished(self) -> bool:
+        if not bracket_is_finished(self.rounds):
+            return False
+        if self.size == 8:
+            if self.losers_rounds is None or not bracket_is_finished(self.losers_rounds):
+                return False
+        return True
+
+    def compute_final_standings(self):
+        """Called once is_fully_finished() is True. Applies Elo across all placements at once."""
+        final_match = self.rounds[-1][0]
+        third_match = self.rounds[-1][1]
+        champion = final_match["winner"]
+        runner_up = final_match["player2"] if champion.id == final_match["player1"].id else final_match["player1"]
+        third = third_match["winner"]
+        fourth = third_match["player2"] if third.id == third_match["player1"].id else third_match["player1"]
+        placements = [champion, runner_up, third, fourth]
+
+        if self.size == 8:
+            fifth_match = self.losers_rounds[-1][0]
+            seventh_match = self.losers_rounds[-1][1]
+            fifth = fifth_match["winner"]
+            sixth = fifth_match["player2"] if fifth.id == fifth_match["player1"].id else fifth_match["player1"]
+            seventh = seventh_match["winner"]
+            eighth = seventh_match["player2"] if seventh.id == seventh_match["player1"].id else seventh_match["player1"]
+            placements += [fifth, sixth, seventh, eighth]
+
+        deltas = db.calculate_elo_changes([p.id for p in placements])
+        db.apply_rating_changes({p.id: d for p, d in zip(placements, deltas)})
+        self.final_standings = list(zip(placements, deltas))
 
     def build_embed(self) -> discord.Embed:
         info = QUEUE_TYPES[self.queue_type]
@@ -734,44 +849,42 @@ class BracketView(discord.ui.View):
             return embed
 
         # Bracket in progress or finished — show full bracket state
-        for round_matches in self.rounds:
-            lines = []
-            for match in round_matches:
-                p1 = match["player1"]
-                p2 = match["player2"]
-                if p1 is None or p2 is None:
-                    lines.append(f"**{match['label']}**: TBD")
-                elif match["winner"] is not None:
-                    winner = match["winner"]
-                    loser = p2 if winner.id == p1.id else p1
-                    lines.append(f"**{match['label']}**: ✅ {winner.mention} def. {loser.mention}")
-                else:
-                    lines.append(f"**{match['label']}**: ⏳ {p1.mention} vs {p2.mention}")
-            round_name = round_matches[0]["label"].split()[0] if len(round_matches) > 1 else "Round"
-            embed.add_field(name=f"Round: {round_name}s", value="\n".join(lines), inline=False)
+        all_round_groups = [self.rounds]
+        if self.losers_rounds:
+            all_round_groups.append(self.losers_rounds)
 
-        pending = get_pending_bracket_matches(self.rounds)
+        for rounds in all_round_groups:
+            for round_matches in rounds:
+                lines = []
+                for match in round_matches:
+                    p1 = match["player1"]
+                    p2 = match["player2"]
+                    if p1 is None or p2 is None:
+                        lines.append(f"**{match['label']}**: TBD")
+                    elif match["winner"] is not None:
+                        winner = match["winner"]
+                        loser = p2 if winner.id == p1.id else p1
+                        lines.append(f"**{match['label']}**: ✅ {winner.mention} def. {loser.mention}")
+                    else:
+                        lines.append(f"**{match['label']}**: ⏳ {p1.mention} vs {p2.mention}")
+                round_name = round_matches[0]["label"]
+                embed.add_field(name=round_name.rsplit(" ", 1)[0] if round_name[-1].isdigit() else round_name, value="\n".join(lines), inline=False)
+
+        pending = self.get_all_pending_matches()
         if pending and not self.finished:
-            next_lines = [f"{m['label']}: {m['player1'].mention} vs {m['player2'].mention}" for _, _, m in pending]
+            next_lines = [f"{m['label']}: {m['player1'].mention} vs {m['player2'].mention}" for _, _, _, m in pending]
             embed.add_field(name="▶️ Next Matches", value="\n".join(next_lines), inline=False)
 
         if self.finished:
-            final_match = self.rounds[-1][0]
-            third_match = self.rounds[-1][1]
-            champion = final_match["winner"]
-            runner_up = final_match["player2"] if champion.id == final_match["player1"].id else final_match["player1"]
-            third = third_match["winner"]
-            fourth = third_match["player2"] if third.id == third_match["player1"].id else third_match["player1"]
-            standings = (
-                f"🥇 {champion.mention}\n"
-                f"🥈 {runner_up.mention}\n"
-                f"🥉 {third.mention}\n"
-                f"4️⃣ {fourth.mention}"
-            )
-            embed.add_field(name="🏁 Final Ranking", value=standings, inline=False)
+            medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣"]
+            lines = []
+            for medal, (member, delta) in zip(medals, self.final_standings):
+                sign = "+" if delta >= 0 else ""
+                lines.append(f"{medal} {member.mention} {sign}{delta}")
+            embed.add_field(name="🏁 Final Ranking", value="\n".join(lines), inline=False)
             embed.set_footer(text="Bracket complete")
         else:
-            embed.set_footer(text="Admins: use Record Match after each game")
+            embed.set_footer(text="Anyone can use Record Match after each game")
 
         return embed
 
@@ -784,20 +897,14 @@ class BracketView(discord.ui.View):
 
     def build_final_ranking_embed(self) -> discord.Embed:
         info = QUEUE_TYPES[self.queue_type]
-        final_match = self.rounds[-1][0]
-        third_match = self.rounds[-1][1]
-        champion = final_match["winner"]
-        runner_up = final_match["player2"] if champion.id == final_match["player1"].id else final_match["player1"]
-        third = third_match["winner"]
-        fourth = third_match["player2"] if third.id == third_match["player1"].id else third_match["player1"]
+        medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣"]
+        lines = []
+        for medal, (member, delta) in zip(medals, self.final_standings):
+            sign = "+" if delta >= 0 else ""
+            lines.append(f"{medal} {member.mention}{sign}{delta}")
 
         embed = discord.Embed(title=f"🏁 {info['label']} Complete!", color=info["color"])
-        embed.description = (
-            f"🥇 {champion.mention}\n"
-            f"🥈 {runner_up.mention}\n"
-            f"🥉 {third.mention}\n"
-            f"4️⃣ {fourth.mention}"
-        )
+        embed.description = "\n".join(lines)
         if self.message:
             embed.description += f"\n\n[Jump to bracket]({self.message.jump_url})"
         return embed
