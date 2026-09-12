@@ -2,6 +2,7 @@ import os
 import discord
 from discord import app_commands
 from discord.ext import commands
+import db
 
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
@@ -10,6 +11,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
+    db.init_db()
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
     try:
         synced = await bot.tree.sync()
@@ -82,11 +84,32 @@ class LFMView(discord.ui.View):
         if self.note:
             embed.add_field(name="Note", value=self.note, inline=False)
 
-        if self.queue:
+        if self.queue_type == "ranked" and self.queue:
+            sorted_queue = sorted(
+                self.queue, key=lambda m: db.get_rating(m.id), reverse=True
+            )
+            lines = []
+            for i, member in enumerate(sorted_queue):
+                rating = db.get_rating(member.id)
+                lines.append(f"{i+1}. {member.mention} ({rating})")
+            listing = "\n".join(lines)
+
+            pairing_lines = []
+            for i in range(0, len(sorted_queue), 2):
+                if i + 1 < len(sorted_queue):
+                    pairing_lines.append(
+                        f"Match {i//2 + 1}: {sorted_queue[i].mention} vs {sorted_queue[i+1].mention}"
+                    )
+                else:
+                    pairing_lines.append(f"Waiting for opponent: {sorted_queue[i].mention}")
+            embed.add_field(name=f"Queue ({len(self.queue)}) — by Elo", value=listing, inline=False)
+            embed.add_field(name="Suggested Pairings", value="\n".join(pairing_lines), inline=False)
+        elif self.queue:
             listing = "\n".join(f"{i+1}. {m.mention}" for i, m in enumerate(self.queue))
+            embed.add_field(name=f"Queue ({len(self.queue)})", value=listing, inline=False)
         else:
-            listing = "*No one in queue yet.*"
-        embed.add_field(name=f"Queue ({len(self.queue)})", value=listing, inline=False)
+            embed.add_field(name="Queue (0)", value="*No one in queue yet.*", inline=False)
+
         embed.set_footer(text="Expires in 1 hour of inactivity")
         return embed
 
@@ -178,6 +201,110 @@ async def queue(
     await interaction.response.send_message(content=role.mention, embed=view.build_embed(), view=view)
     view.message = await interaction.original_response()
     active_queues[key] = view
+
+
+async def build_leaderboard_embed(guild: discord.Guild) -> discord.Embed:
+    rows = db.get_leaderboard(limit=10)
+    embed = discord.Embed(title="🏆 Ranked Leaderboard", color=discord.Color.gold())
+    if not rows:
+        embed.description = "No ranked matches recorded yet."
+        return embed
+
+    lines = []
+    for i, (user_id, rating, games) in enumerate(rows):
+        member = guild.get_member(user_id)
+        name = member.mention if member else f"<@{user_id}>"
+        lines.append(f"**{i+1}.** {name} — {rating} pts ({games} games)")
+    embed.description = "\n".join(lines)
+    embed.set_footer(text="Updates automatically after every recorded match")
+    return embed
+
+
+async def update_leaderboard_message(guild: discord.Guild):
+    ref = db.get_leaderboard_message(guild.id)
+    if not ref:
+        return
+    channel_id, message_id = ref
+    channel = guild.get_channel(channel_id) or bot.get_channel(channel_id)
+    if not channel:
+        return
+    try:
+        message = await channel.fetch_message(message_id)
+        await message.edit(embed=await build_leaderboard_embed(guild))
+    except discord.NotFound:
+        pass
+    except discord.HTTPException:
+        pass
+
+
+@bot.tree.command(name="leaderboard", description="Post the ranked leaderboard (auto-updates after each match)")
+async def leaderboard(interaction: discord.Interaction):
+    embed = await build_leaderboard_embed(interaction.guild)
+    await interaction.response.send_message(embed=embed)
+    message = await interaction.original_response()
+    db.set_leaderboard_message(interaction.guild_id, message.channel.id, message.id)
+
+
+@bot.tree.command(name="record-match", description="[Admin] Record a ranked match result (up to 8 places)")
+@app_commands.describe(
+    place1="1st place",
+    place2="2nd place",
+    place3="3rd place",
+    place4="4th place",
+    place5="5th place",
+    place6="6th place",
+    place7="7th place",
+    place8="8th place",
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def record_match(
+    interaction: discord.Interaction,
+    place1: discord.Member,
+    place2: discord.Member = None,
+    place3: discord.Member = None,
+    place4: discord.Member = None,
+    place5: discord.Member = None,
+    place6: discord.Member = None,
+    place7: discord.Member = None,
+    place8: discord.Member = None,
+):
+    placements = [p for p in [place1, place2, place3, place4, place5, place6, place7, place8] if p]
+
+    if len(set(m.id for m in placements)) != len(placements):
+        await interaction.response.send_message(
+            "The same player can't appear in multiple places.", ephemeral=True
+        )
+        return
+
+    before = {m.id: db.get_rating(m.id) for m in placements}
+    deltas = db.calculate_elo_changes([m.id for m in placements])
+    db.apply_rating_changes({m.id: d for m, d in zip(placements, deltas)})
+
+    lines = []
+    for i, member in enumerate(placements):
+        old = before[member.id]
+        delta = deltas[i]
+        new = old + delta
+        sign = "+" if delta >= 0 else ""
+        lines.append(f"**{i+1}.** {member.mention} — {old} → {new} ({sign}{delta})")
+
+    embed = discord.Embed(
+        title="🏓 Ranked Match Recorded",
+        description="\n".join(lines),
+        color=discord.Color.orange(),
+    )
+    await interaction.response.send_message(embed=embed)
+    await update_leaderboard_message(interaction.guild)
+
+
+@record_match.error
+async def record_match_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message(
+            "Only admins can record ranked matches.", ephemeral=True
+        )
+    else:
+        raise error
 
 
 bot.run(TOKEN)
