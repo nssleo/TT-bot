@@ -307,4 +307,32 @@ async def record_match_error(interaction: discord.Interaction, error: app_comman
         raise error
 
 
+@bot.tree.command(name="set-elo-balance", description="[Admin] Adjust how much wins vs losses affect Elo")
+@app_commands.describe(
+    win_multiplier="Multiplier applied to Elo gains (e.g. 1.5 = gain 50% more than standard)",
+    loss_multiplier="Multiplier applied to Elo losses (e.g. 0.5 = lose 50% less than standard)",
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def set_elo_balance(interaction: discord.Interaction, win_multiplier: float, loss_multiplier: float):
+    if win_multiplier <= 0 or loss_multiplier <= 0:
+        await interaction.response.send_message("Multipliers must be greater than 0.", ephemeral=True)
+        return
+    db.set_config("win_multiplier", win_multiplier)
+    db.set_config("loss_multiplier", loss_multiplier)
+    await interaction.response.send_message(
+        f"Elo balance updated: wins now scale by **{win_multiplier}x**, losses by **{loss_multiplier}x**.\n"
+        f"This only affects matches recorded from now on."
+    )
+
+
+@set_elo_balance.error
+async def set_elo_balance_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message(
+            "Only admins can adjust Elo balance.", ephemeral=True
+        )
+    else:
+        raise error
+
+
 bot.run(TOKEN)

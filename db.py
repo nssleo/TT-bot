@@ -1,7 +1,8 @@
+import os
 import sqlite3
 from contextlib import closing
 
-DB_PATH = "ranked.db"
+DB_PATH = os.getenv("DB_PATH", "ranked.db")
 DEFAULT_RATING = 1000
 K = 16  # points per pairwise comparison
 
@@ -25,6 +26,32 @@ def init_db():
                 message_id INTEGER NOT NULL
             )
             """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS config (
+                key TEXT PRIMARY KEY,
+                value REAL NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def get_config(key: str, default: float) -> float:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        row = conn.execute("SELECT value FROM config WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else default
+
+
+def set_config(key: str, value: float):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute(
+            """
+            INSERT INTO config (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = ?
+            """,
+            (key, value, value),
         )
         conn.commit()
 
@@ -104,7 +131,12 @@ def calculate_elo_changes(placements: list[int]) -> list[int]:
     placements: list of user_ids in finishing order (index 0 = 1st place).
     Returns list of rating deltas in the same order, computed by comparing
     every pair: better placement counts as a 1v1 win over worse placement.
+    Wins and losses are scaled independently via config (win_multiplier /
+    loss_multiplier), so gains and losses don't have to be symmetric.
     """
+    win_mult = get_config("win_multiplier", 1.0)
+    loss_mult = get_config("loss_multiplier", 1.0)
+
     ratings = [get_rating(uid) for uid in placements]
     deltas = [0.0] * len(placements)
 
@@ -115,6 +147,7 @@ def calculate_elo_changes(placements: list[int]) -> list[int]:
             # i finished better than j (lower index = better placement)
             expected_i = 1 / (1 + 10 ** ((ratings[j] - ratings[i]) / 400))
             actual_i = 1 if i < j else 0
-            deltas[i] += K * (actual_i - expected_i)
+            raw = K * (actual_i - expected_i)
+            deltas[i] += raw * win_mult if raw >= 0 else raw * loss_mult
 
     return [round(d) for d in deltas]
