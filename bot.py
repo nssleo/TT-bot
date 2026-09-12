@@ -260,15 +260,18 @@ async def queue(
     role: discord.Role = None,
     note: str = None,
 ):
+    is_bracket = QUEUE_TYPES[type.value]["size"] is not None
     key = (interaction.guild_id, type.value)
-    existing = active_queues.get(key)
-    if existing:
-        link = existing.message.jump_url if existing.message else None
-        msg = f"A {type.name} is already active."
-        if link:
-            msg += f" Jump to it here: {link}"
-        await interaction.response.send_message(msg, ephemeral=True)
-        return
+
+    if not is_bracket:
+        existing = active_queues.get(key)
+        if existing:
+            link = existing.message.jump_url if existing.message else None
+            msg = f"A {type.name} is already active."
+            if link:
+                msg += f" Jump to it here: {link}"
+            await interaction.response.send_message(msg, ephemeral=True)
+            return
 
     size = QUEUE_TYPES[type.value]["size"]
     if size:
@@ -297,57 +300,90 @@ async def queue(
         message = await interaction.original_response()
 
     view.message = message
-    active_queues[key] = view
+    if not is_bracket:
+        active_queues[key] = view
+
+
+async def post_to_results_channel(guild: discord.Guild, content: str = None, embed: discord.Embed = None):
+    channel_id = db.get_results_channel(guild.id)
+    if not channel_id:
+        return
+    channel = guild.get_channel(channel_id) or bot.get_channel(channel_id)
+    if not channel:
+        return
+    try:
+        await channel.send(content=content, embed=embed)
+    except discord.HTTPException:
+        pass
 
 
 class ConfirmResultView(discord.ui.View):
-    def __init__(self, bracket_view: "BracketView", round_idx: int, match_idx: int, winner: discord.Member, loser: discord.Member, reporter_id: int):
+    """
+    Generic result-confirmation view.
+    - required_confirmer_id set -> only that specific user may confirm (used for 1v1 reports).
+    - required_confirmer_id None -> anyone except the reporter may confirm (used for bracket matches).
+    - on_confirm(interaction) is called after Elo is applied, for any extra bookkeeping
+      (e.g. advancing a bracket). If omitted, the confirmed result is posted to the results channel.
+    """
+
+    def __init__(
+        self,
+        winner: discord.Member,
+        loser: discord.Member,
+        reporter_id: int,
+        label: str,
+        required_confirmer_id: int = None,
+        on_confirm=None,
+    ):
         super().__init__(timeout=600)  # 10 minutes to confirm
-        self.bracket_view = bracket_view
-        self.round_idx = round_idx
-        self.match_idx = match_idx
         self.winner = winner
         self.loser = loser
         self.reporter_id = reporter_id
+        self.label = label
+        self.required_confirmer_id = required_confirmer_id
+        self.on_confirm = on_confirm
         self.resolved = False
+        self.message: discord.Message = None
 
     @discord.ui.button(label="Confirm", style=discord.ButtonStyle.success, emoji="✅")
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id == self.reporter_id:
+        if self.required_confirmer_id is not None:
+            if interaction.user.id != self.required_confirmer_id:
+                await interaction.response.send_message(
+                    "Only the opponent in this match can confirm this result.", ephemeral=True
+                )
+                return
+        elif interaction.user.id == self.reporter_id:
             await interaction.response.send_message(
                 "You reported this result — someone else needs to confirm it.", ephemeral=True
             )
             return
+
         if self.resolved:
             await interaction.response.send_message("This result was already resolved.", ephemeral=True)
             return
         self.resolved = True
 
-        match = self.bracket_view.rounds[self.round_idx][self.match_idx]
-        record_bracket_result(self.bracket_view.rounds, self.round_idx, self.match_idx, self.winner)
-
         deltas = db.calculate_elo_changes([self.winner.id, self.loser.id])
         db.apply_rating_changes({self.winner.id: deltas[0], self.loser.id: deltas[1]})
-
-        if bracket_is_finished(self.bracket_view.rounds):
-            self.bracket_view.finished = True
-            self.bracket_view.clear_items()
-            key = (self.bracket_view.guild_id, self.bracket_view.queue_type)
-            if active_queues.get(key) is self.bracket_view:
-                del active_queues[key]
-
-        await self.bracket_view.refresh()
-
-        guild = interaction.guild
-        if guild:
-            await update_leaderboard_message(guild)
 
         for item in self.children:
             item.disabled = True
         await interaction.response.edit_message(
-            content=f"✅ Confirmed by {interaction.user.mention}: **{self.winner.mention}** defeated {self.loser.mention} — {match['label']}",
+            content=f"✅ Confirmed by {interaction.user.mention}: **{self.winner.mention}** defeated {self.loser.mention} — {self.label}",
             view=self,
         )
+
+        if self.on_confirm:
+            await self.on_confirm(interaction)
+        else:
+            guild = interaction.guild
+            if guild:
+                await update_leaderboard_message(guild)
+                await post_to_results_channel(
+                    guild,
+                    content=f"🏓 **{self.winner.mention}** defeated {self.loser.mention} — {self.label}",
+                )
 
     @discord.ui.button(label="Reject", style=discord.ButtonStyle.danger, emoji="❌")
     async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -358,7 +394,7 @@ class ConfirmResultView(discord.ui.View):
         for item in self.children:
             item.disabled = True
         await interaction.response.edit_message(
-            content=f"❌ Result rejected by {interaction.user.mention}. Please record the match again if needed.",
+            content=f"❌ Result rejected by {interaction.user.mention}. Please report the match again if needed.",
             view=self,
         )
 
@@ -395,8 +431,29 @@ class BracketWinnerSelect(discord.ui.Select):
             content="Report submitted — waiting for confirmation.", view=None
         )
 
+        bracket_view = self.bracket_view
+        round_idx = self.round_idx
+        match_idx = self.match_idx
+
+        async def on_confirm(confirm_interaction: discord.Interaction):
+            record_bracket_result(bracket_view.rounds, round_idx, match_idx, winner)
+            if bracket_is_finished(bracket_view.rounds):
+                bracket_view.finished = True
+                bracket_view.clear_items()
+            await bracket_view.refresh()
+            guild = confirm_interaction.guild
+            if guild:
+                await update_leaderboard_message(guild)
+                if bracket_view.finished:
+                    await post_to_results_channel(guild, embed=bracket_view.build_final_ranking_embed())
+
         confirm_view = ConfirmResultView(
-            self.bracket_view, self.round_idx, self.match_idx, winner, loser, reporter_id=interaction.user.id
+            winner=winner,
+            loser=loser,
+            reporter_id=interaction.user.id,
+            label=self.match["label"],
+            required_confirmer_id=None,  # anyone but the reporter
+            on_confirm=on_confirm,
         )
         if self.bracket_view.message:
             confirm_view.message = await self.bracket_view.message.channel.send(
@@ -540,6 +597,26 @@ class BracketView(discord.ui.View):
             except discord.HTTPException:
                 pass
 
+    def build_final_ranking_embed(self) -> discord.Embed:
+        info = QUEUE_TYPES[self.queue_type]
+        final_match = self.rounds[-1][0]
+        third_match = self.rounds[-1][1]
+        champion = final_match["winner"]
+        runner_up = final_match["player2"] if champion.id == final_match["player1"].id else final_match["player1"]
+        third = third_match["winner"]
+        fourth = third_match["player2"] if third.id == third_match["player1"].id else third_match["player1"]
+
+        embed = discord.Embed(title=f"🏁 {info['label']} Complete!", color=info["color"])
+        embed.description = (
+            f"🥇 {champion.mention}\n"
+            f"🥈 {runner_up.mention}\n"
+            f"🥉 {third.mention}\n"
+            f"4️⃣ {fourth.mention}"
+        )
+        if self.message:
+            embed.description += f"\n\n[Jump to bracket]({self.message.jump_url})"
+        return embed
+
     def start_bracket(self):
         seeded = sorted(self.queue, key=lambda m: db.get_rating(m.id), reverse=True)
         self.rounds = build_bracket_rounds(seeded)
@@ -596,9 +673,6 @@ class BracketView(discord.ui.View):
                 await self.message.edit(view=self)
             except discord.HTTPException:
                 pass
-        key = (self.guild_id, self.queue_type)
-        if active_queues.get(key) is self:
-            del active_queues[key]
 
 
 async def build_leaderboard_embed(guild: discord.Guild) -> discord.Embed:
@@ -731,6 +805,54 @@ async def set_elo_balance_error(interaction: discord.Interaction, error: app_com
         )
     else:
         raise error
+
+
+@bot.tree.command(name="set-results-channel", description="[Admin] Set the channel where final results get posted")
+@app_commands.describe(channel="Channel for bracket final rankings and confirmed 1v1 results")
+@app_commands.checks.has_permissions(administrator=True)
+async def set_results_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    db.set_results_channel(interaction.guild_id, channel.id)
+    await interaction.response.send_message(f"Results will now be posted in {channel.mention}.")
+
+
+@set_results_channel.error
+async def set_results_channel_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message(
+            "Only admins can set the results channel.", ephemeral=True
+        )
+    else:
+        raise error
+
+
+@bot.tree.command(name="report-match", description="Report a ranked 1v1 result — your opponent must confirm it")
+@app_commands.describe(opponent="Who you played against", i_won="Did you win?")
+async def report_match(interaction: discord.Interaction, opponent: discord.Member, i_won: bool):
+    if opponent.id == interaction.user.id:
+        await interaction.response.send_message("You can't report a match against yourself.", ephemeral=True)
+        return
+    if opponent.bot:
+        await interaction.response.send_message("You can't report a match against a bot.", ephemeral=True)
+        return
+
+    winner = interaction.user if i_won else opponent
+    loser = opponent if i_won else interaction.user
+
+    confirm_view = ConfirmResultView(
+        winner=winner,
+        loser=loser,
+        reporter_id=interaction.user.id,
+        label="Ranked 1v1",
+        required_confirmer_id=opponent.id,
+    )
+    await interaction.response.send_message(
+        content=(
+            f"📋 {interaction.user.mention} reports **{winner.mention}** defeated {loser.mention}.\n"
+            f"{opponent.mention}, please confirm or reject this result."
+        ),
+        view=confirm_view,
+    )
+    confirm_view.message = await interaction.original_response()
 
 
 bot.run(TOKEN)

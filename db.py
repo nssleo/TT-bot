@@ -35,7 +35,35 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS guild_settings (
+                guild_id INTEGER PRIMARY KEY,
+                results_channel_id INTEGER
+            )
+            """
+        )
         conn.commit()
+
+
+def set_results_channel(guild_id: int, channel_id: int):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute(
+            """
+            INSERT INTO guild_settings (guild_id, results_channel_id) VALUES (?, ?)
+            ON CONFLICT(guild_id) DO UPDATE SET results_channel_id = ?
+            """,
+            (guild_id, channel_id, channel_id),
+        )
+        conn.commit()
+
+
+def get_results_channel(guild_id: int):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        row = conn.execute(
+            "SELECT results_channel_id FROM guild_settings WHERE guild_id = ?", (guild_id,)
+        ).fetchone()
+        return row[0] if row and row[0] else None
 
 
 def get_config(key: str, default: float) -> float:
