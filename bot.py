@@ -13,6 +13,9 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 @bot.event
 async def on_ready():
     db.init_db()
+    status = db.get_db_status()
+    print(f"[db] path={status['path']} exists={status['exists_on_disk']} "
+          f"size={status['size_bytes']}B players={status['player_count']}")
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
     try:
         synced = await bot.tree.sync()
@@ -208,6 +211,26 @@ class KickView(discord.ui.View):
         self.add_item(KickSelect(parent_view))
 
 
+class CountdownButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Countdown", style=discord.ButtonStyle.primary, emoji="⏱️")
+
+    async def callback(self, interaction: discord.Interaction):
+        view: "LFMView" = self.view
+        if len(view.queue) < 2:
+            await interaction.response.send_message(
+                "Need at least 2 players in the queue to start.", ephemeral=True
+            )
+            return
+        await interaction.response.send_message("🏓 Starting matches!")
+        channel = interaction.channel
+        for n in (5, 4, 3, 2, 1):
+            await asyncio.sleep(1)
+            await channel.send(str(n))
+        await asyncio.sleep(1)
+        await channel.send("**GO**")
+
+
 class LFMView(discord.ui.View):
     def __init__(self, requester: discord.Member, queue_type: str, guild_id: int, note: str = None):
         super().__init__(timeout=3600)  # auto-expire after 1 hour
@@ -217,6 +240,13 @@ class LFMView(discord.ui.View):
         self.note = note
         self.queue: list[discord.Member] = []
         self.message: discord.Message = None
+
+        if self.queue_type == "global":
+            # Global gets a Countdown button instead of Start Matches (no channel creation)
+            for item in list(self.children):
+                if isinstance(item, discord.ui.Button) and item.label == "Start Matches":
+                    self.remove_item(item)
+            self.add_item(CountdownButton())
 
     def build_embed(self) -> discord.Embed:
         info = QUEUE_TYPES[self.queue_type]
@@ -306,16 +336,6 @@ class LFMView(discord.ui.View):
             await interaction.response.send_message(
                 "Need at least 2 players in the queue to start matches.", ephemeral=True
             )
-            return
-
-        if self.queue_type == "global":
-            await interaction.response.send_message("🏓 Starting matches!")
-            channel = interaction.channel
-            for n in (5, 4, 3, 2, 1):
-                await asyncio.sleep(1)
-                await channel.send(str(n))
-            await asyncio.sleep(1)
-            await channel.send("**GO**")
             return
 
         # casual / ranked -> create a private match channel per pairing
@@ -431,14 +451,19 @@ async def queue(
 async def post_to_results_channel(guild: discord.Guild, content: str = None, embed: discord.Embed = None):
     channel_id = db.get_results_channel(guild.id)
     if not channel_id:
+        print(f"[results] No results channel configured for guild {guild.id}")
         return
-    channel = guild.get_channel(channel_id) or bot.get_channel(channel_id)
+    channel = guild.get_channel(channel_id)
     if not channel:
-        return
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except discord.HTTPException as e:
+            print(f"[results] Could not fetch results channel {channel_id} for guild {guild.id}: {e}")
+            return
     try:
         await channel.send(content=content, embed=embed)
-    except discord.HTTPException:
-        pass
+    except discord.HTTPException as e:
+        print(f"[results] Failed to send to results channel {channel_id}: {e}")
 
 
 def build_match_result_embed(winner: discord.Member, loser: discord.Member, before: dict, after: dict, label: str) -> discord.Embed:
@@ -514,19 +539,36 @@ class ConfirmResultView(discord.ui.View):
 
         for item in self.children:
             item.disabled = True
-        await interaction.response.edit_message(
-            content=f"✅ Confirmed by {interaction.user.mention}",
-            embed=result_embed,
-            view=self,
-        )
 
         if self.on_confirm:
+            # Bracket match: full detail stays in the origin channel; on_confirm handles
+            # bracket advancement and (if the bracket just finished) the results-channel post.
+            await interaction.response.edit_message(
+                content=f"✅ Confirmed by {interaction.user.mention}",
+                embed=result_embed,
+                view=self,
+            )
             await self.on_confirm(interaction)
         else:
             guild = interaction.guild
+            results_channel_id = db.get_results_channel(guild.id) if guild else None
+            if results_channel_id:
+                # Full detail goes to the results channel; origin just gets a short note.
+                await interaction.response.edit_message(
+                    content=f"✅ Confirmed by {interaction.user.mention} — result posted in the results channel.",
+                    embed=None,
+                    view=self,
+                )
+                await post_to_results_channel(guild, embed=result_embed)
+            else:
+                # No results channel configured — keep the full detail here so it isn't lost.
+                await interaction.response.edit_message(
+                    content=f"✅ Confirmed by {interaction.user.mention}",
+                    embed=result_embed,
+                    view=self,
+                )
             if guild:
                 await update_leaderboard_message(guild)
-                await post_to_results_channel(guild, embed=result_embed)
 
     @discord.ui.button(label="Reject", style=discord.ButtonStyle.danger, emoji="❌")
     async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1021,6 +1063,30 @@ async def set_match_category_error(interaction: discord.Interaction, error: app_
         await interaction.response.send_message(
             "Only admins can set the match category.", ephemeral=True
         )
+    else:
+        raise error
+
+
+@bot.tree.command(name="db-status", description="[Admin] Check database persistence (path, size, player count)")
+@app_commands.checks.has_permissions(administrator=True)
+async def db_status(interaction: discord.Interaction):
+    status = db.get_db_status()
+    embed = discord.Embed(title="🗄️ Database Status", color=discord.Color.blue())
+    embed.add_field(name="Path", value=f"`{status['path']}`", inline=False)
+    embed.add_field(name="File exists", value=str(status["exists_on_disk"]), inline=True)
+    embed.add_field(name="Size", value=f"{status['size_bytes']} bytes", inline=True)
+    embed.add_field(name="Players tracked", value=str(status["player_count"]), inline=True)
+    if status["path"].startswith("/data"):
+        embed.set_footer(text="Using the persistent volume path — should survive redeploys.")
+    else:
+        embed.set_footer(text="⚠️ Not using /data — this will reset on the next redeploy!")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@db_status.error
+async def db_status_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("Only admins can check database status.", ephemeral=True)
     else:
         raise error
 

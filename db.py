@@ -132,7 +132,15 @@ def set_config(key: str, value: float):
         conn.commit()
 
 
-def get_rating(user_id: int) -> int:
+def get_db_status() -> dict:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        player_count = conn.execute("SELECT COUNT(*) FROM players").fetchone()[0]
+    return {
+        "path": os.path.abspath(DB_PATH),
+        "exists_on_disk": os.path.exists(DB_PATH),
+        "size_bytes": os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0,
+        "player_count": player_count,
+    }
     with closing(sqlite3.connect(DB_PATH)) as conn:
         row = conn.execute(
             "SELECT rating FROM players WHERE user_id = ?", (user_id,)
