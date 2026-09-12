@@ -150,20 +150,11 @@ class AddPlayerSelect(discord.ui.UserSelect):
         if member.id in [m.id for m in self.parent_view.queue]:
             await interaction.response.edit_message(content=f"{member.display_name} is already in the queue.", view=None)
             return
-
-        size = getattr(self.parent_view, "size", None)
-        started = getattr(self.parent_view, "started", False)
-        if started:
+        if getattr(self.parent_view, "started", False):
             await interaction.response.edit_message(content="This bracket has already started.", view=None)
-            return
-        if size and len(self.parent_view.queue) >= size:
-            await interaction.response.edit_message(content="The queue is already full.", view=None)
             return
 
         self.parent_view.queue.append(member)
-        if size and len(self.parent_view.queue) == size:
-            self.parent_view.start_bracket()
-
         await interaction.response.edit_message(content=f"Added {member.display_name} to the queue.", view=None)
         await self.parent_view.refresh()
 
@@ -438,15 +429,6 @@ async def queue(
     size = QUEUE_TYPES[type.value]["size"]
 
     if size:
-        # Brackets get their own dedicated channel, e.g. "4p-bracket-1", "8p-bracket-1"
-        # — separate running counters per size.
-        guild = interaction.guild
-        bracket_number = db.get_next_bracket_number(guild.id, size)
-        channel_name = f"{size}p-bracket-{bracket_number}"
-        category_id = db.get_match_category(guild.id)
-        category = guild.get_channel(category_id) if category_id else None
-        bracket_channel = await guild.create_text_channel(name=channel_name, category=category)
-
         view = BracketView(
             requester=interaction.user,
             queue_type=type.value,
@@ -455,13 +437,12 @@ async def queue(
             note=note,
         )
         if role:
-            await bracket_channel.send(role.mention)
-        message = await bracket_channel.send(embed=view.build_embed(), view=view)
+            await interaction.response.send_message(role.mention)
+            message = await interaction.followup.send(embed=view.build_embed(), view=view)
+        else:
+            await interaction.response.send_message(embed=view.build_embed(), view=view)
+            message = await interaction.original_response()
         view.message = message
-
-        await interaction.response.send_message(
-            f"Created {bracket_channel.mention} for this bracket!", ephemeral=True
-        )
         return
 
     view = LFMView(
@@ -689,6 +670,23 @@ class BracketWinnerSelect(discord.ui.Select):
                 await update_leaderboard_message(guild)
                 if bracket_view.finished:
                     await post_to_results_channel(guild, embed=bracket_view.build_final_ranking_embed())
+                    if bracket_view.channel:
+                        channel_to_delete = bracket_view.channel
+
+                        async def delete_after_delay():
+                            await asyncio.sleep(180)  # 3 minutes
+                            try:
+                                await channel_to_delete.delete()
+                            except discord.HTTPException:
+                                pass
+
+                        asyncio.create_task(delete_after_delay())
+                        try:
+                            await bracket_view.channel.send(
+                                "🏁 Bracket complete! This channel will be deleted in 3 minutes."
+                            )
+                        except discord.HTTPException:
+                            pass
 
         confirm_view = ConfirmResultView(
             winner=winner,
@@ -762,6 +760,25 @@ class RecordMatchButton(discord.ui.Button):
         )
 
 
+class ConfirmStartBracketView(discord.ui.View):
+    def __init__(self, bracket_view: "BracketView"):
+        super().__init__(timeout=60)
+        self.bracket_view = bracket_view
+
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.success, emoji="✅")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="Starting bracket(s)...", view=self)
+        await self.bracket_view.split_and_start_brackets(interaction.guild)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, emoji="❌")
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="Cancelled.", view=self)
+
+
 class BracketView(discord.ui.View):
     def __init__(self, requester: discord.Member, queue_type: str, guild_id: int, size: int, note: str = None):
         super().__init__(timeout=3600)
@@ -777,6 +794,7 @@ class BracketView(discord.ui.View):
         self.started = False
         self.finished = False
         self.final_standings = None  # set once fully finished: list of (member, elo_delta) tuples
+        self.channel: discord.TextChannel = None  # set once the bracket starts (private match channel)
 
     def get_all_pending_matches(self):
         """Returns list of (bracket_key, round_idx, match_idx, match) across main + losers brackets."""
@@ -845,7 +863,7 @@ class BracketView(discord.ui.View):
             else:
                 listing = "*No one in queue yet.*"
             embed.add_field(name=f"Players ({len(self.queue)}/{self.size})", value=listing, inline=False)
-            embed.set_footer(text="Bracket starts automatically once full")
+            embed.set_footer(text="Press Start Bracket when ready — more than one bracket's worth of players will be split by Elo")
             return embed
 
         # Bracket in progress or finished — show full bracket state
@@ -909,31 +927,77 @@ class BracketView(discord.ui.View):
             embed.description += f"\n\n[Jump to bracket]({self.message.jump_url})"
         return embed
 
-    def start_bracket(self):
+    async def start_bracket(self, guild: discord.Guild):
+        """Turns this view's current queue (must be exactly self.size players) into a live bracket
+        with its own private channel. Used both directly and by split_and_start_brackets()."""
         seeded = sorted(self.queue, key=lambda m: db.get_rating(m.id), reverse=True)
         self.rounds = build_bracket_rounds(seeded)
         self.started = True
         self.clear_items()
         self.add_item(RecordMatchButton())
 
+        bracket_number = db.get_next_bracket_number(guild.id, self.size)
+        channel_name = f"{self.size}p-bracket-{bracket_number}"
+        category_id = db.get_match_category(guild.id)
+        category = guild.get_channel(category_id) if category_id else None
+
+        overwrites = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
+        for member in self.queue:
+            overwrites[member] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+
+        self.channel = await guild.create_text_channel(name=channel_name, category=category, overwrites=overwrites)
+        self.message = await self.channel.send(embed=self.build_embed(), view=self)
+
+    async def split_and_start_brackets(self, guild: discord.Guild):
+        """
+        Splits the current queue into as many full groups of self.size as possible, sorted by
+        Elo (highest-rated group first), and starts a separate bracket+channel for each.
+        Any remainder stays in this queue, waiting for more players.
+        """
+        sorted_queue = sorted(self.queue, key=lambda m: db.get_rating(m.id), reverse=True)
+        groups = [sorted_queue[i:i + self.size] for i in range(0, len(sorted_queue), self.size)]
+        leftover = groups.pop() if groups and len(groups[-1]) < self.size else []
+
+        created_channels = []
+        for group in groups:
+            bracket = BracketView(
+                requester=self.requester,
+                queue_type=self.queue_type,
+                guild_id=self.guild_id,
+                size=self.size,
+                note=self.note,
+            )
+            bracket.queue = group
+            await bracket.start_bracket(guild)
+            created_channels.append(bracket.channel)
+
+        self.queue = leftover
+        summary = "\n".join(c.mention for c in created_channels)
+
+        if leftover:
+            await self.refresh()
+            try:
+                await self.message.channel.send(f"🏓 Started {len(created_channels)} bracket(s):\n{summary}")
+            except discord.HTTPException:
+                pass
+        else:
+            try:
+                await self.message.edit(
+                    content=f"🏓 Started {len(created_channels)} bracket(s):\n{summary}", embed=None, view=None
+                )
+            except discord.HTTPException:
+                pass
+
     @discord.ui.button(label="Join Queue", style=discord.ButtonStyle.success, emoji="🏓")
     async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id in [m.id for m in self.queue]:
             await interaction.response.send_message("You're already in the queue.", ephemeral=True)
             return
-        if len(self.queue) >= self.size:
-            await interaction.response.send_message("This bracket is already full.", ephemeral=True)
-            return
         self.queue.append(interaction.user)
-        if len(self.queue) == self.size:
-            self.start_bracket()
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
     @discord.ui.button(label="Leave Queue", style=discord.ButtonStyle.secondary, emoji="🚪")
     async def leave(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.started:
-            await interaction.response.send_message("The bracket has already started.", ephemeral=True)
-            return
         if interaction.user.id not in [m.id for m in self.queue]:
             await interaction.response.send_message("You're not in the queue.", ephemeral=True)
             return
@@ -942,9 +1006,6 @@ class BracketView(discord.ui.View):
 
     @discord.ui.button(label="Kick Queue", style=discord.ButtonStyle.danger, emoji="⛔")
     async def kick(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.started:
-            await interaction.response.send_message("The bracket has already started.", ephemeral=True)
-            return
         if interaction.user.id != self.requester.id:
             await interaction.response.send_message(
                 "Only the person who started this bracket can kick players.", ephemeral=True
@@ -959,12 +1020,30 @@ class BracketView(discord.ui.View):
 
     @discord.ui.button(label="Add Player", style=discord.ButtonStyle.secondary, emoji="➕")
     async def add_player(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.started:
-            await interaction.response.send_message("The bracket has already started.", ephemeral=True)
-            return
         await interaction.response.send_message(
             "Who do you want to add to the bracket?", view=AddPlayerView(self), ephemeral=True
         )
+
+    @discord.ui.button(label="Start Bracket", style=discord.ButtonStyle.primary, emoji="▶️")
+    async def start_bracket_prompt(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if len(self.queue) < self.size:
+            await interaction.response.send_message(
+                f"Need at least {self.size} players to start a bracket — currently {len(self.queue)}.",
+                ephemeral=True,
+            )
+            return
+
+        num_full = len(self.queue) // self.size
+        leftover_count = len(self.queue) % self.size
+        plural = "s" if num_full != 1 else ""
+        msg = (
+            f"This will start **{num_full} bracket{plural}** of {self.size} players each, "
+            f"split by Elo (top {self.size} in bracket 1, next {self.size} in bracket 2, etc.)."
+        )
+        if leftover_count:
+            msg += f"\n{leftover_count} player(s) will remain in the queue, waiting for more."
+
+        await interaction.response.send_message(msg, view=ConfirmStartBracketView(self), ephemeral=True)
 
     async def on_timeout(self):
         for item in self.children:
